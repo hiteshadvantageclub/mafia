@@ -30,17 +30,17 @@ interface GameMessage {
   isReady?: boolean;
 }
 
-type WebSocketConnection = {
+interface WebSocketConnection {
   socket: WebSocket;
-  roomCode: string | null;
-  playerId: string | null;
-};
+  roomCode: string | undefined;
+  playerId: string | undefined;
+}
 
 // Store active rooms and their data
 const rooms = new Map<string, Room>();
 
 // Store WebSocket connections
-const connections = new Map<string, WebSocketConnection>();
+const activeConnections = new Map<string, WebSocketConnection>();
 
 // Generate a random 6-character room code
 function generateRoomCode(): string {
@@ -53,19 +53,19 @@ function generateRoomCode(): string {
 }
 
 // Helper function to broadcast to all clients in a room
-function broadcastToRoom(roomCode: string, message: any) {
-  connections.forEach((conn) => {
+function broadcastToRoom(roomCode: string, message: unknown) {
+  for (const conn of activeConnections.values()) {
     if (conn.roomCode === roomCode && conn.socket.readyState === 1) {
       conn.socket.send(JSON.stringify(message));
     }
-  });
+  }
 }
 
 // Helper function to handle WebSocket messages
 async function handleMessage(socketId: string, conn: WebSocketConnection, data: string) {
   try {
     const message = JSON.parse(data) as GameMessage;
-    console.log('Received:', message);
+    const room = conn.roomCode ? rooms.get(conn.roomCode) : undefined;
 
     if (!message.type) {
       conn.socket.send(JSON.stringify({
@@ -194,8 +194,8 @@ async function handleMessage(socketId: string, conn: WebSocketConnection, data: 
           });
         }
 
-        conn.roomCode = null;
-        conn.playerId = null;
+        conn.roomCode = undefined;
+        conn.playerId = undefined;
         break;
       }
 
@@ -255,19 +255,17 @@ interface WebSocketConnection {
   playerId: string | null;
 }
 
-function generateAcceptKey(key: string): string {
+async function generateAcceptKey(key: string): Promise<string> {
   const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
-  const crypto = require('crypto');
-  const acceptKey = crypto
-    .createHash('sha1')
-    .update(key + GUID)
-    .digest('base64');
-  return acceptKey;
+  const encoder = new TextEncoder();
+  const data = encoder.encode(key + GUID);
+  const hash = await crypto.subtle.digest('SHA-1', data);
+  return btoa(String.fromCharCode(...new Uint8Array(hash)));
 }
 
-function acceptWebSocket(req: NextRequest): Response {
+async function acceptWebSocket(req: NextRequest): Promise<Response> {
   const socketKey = req.headers.get('sec-websocket-key') || '';
-  const acceptKey = generateAcceptKey(socketKey);
+  const acceptKey = await generateAcceptKey(socketKey);
   const socketProtocol = req.headers.get('sec-websocket-protocol') || '';
 
   return new Response(null, {
@@ -282,89 +280,72 @@ function acceptWebSocket(req: NextRequest): Response {
 }
 
 export async function GET(req: NextRequest) {
-  try {
-    if (req.headers.get('upgrade') !== 'websocket') {
-      return new Response('Expected Upgrade: websocket', { status: 426 });
-    }
+  if (req.headers.get('upgrade') !== 'websocket') {
+    return new Response('Expected Upgrade: websocket', { status: 426 });
+  }
 
-    if (!req.headers.get('upgrade') || req.headers.get('upgrade').toLowerCase() !== 'websocket') {
-      return new Response('Expected Upgrade: websocket', { status: 426 });
-    }
+  const socketKey = req.headers.get('sec-websocket-key') || '';
+  const acceptKey = await generateAcceptKey(socketKey);
+  const socketProtocol = req.headers.get('sec-websocket-protocol') || '';
 
-    const socketKey = req.headers.get('sec-websocket-key');
-    if (!socketKey) {
-      return new Response('Missing Sec-WebSocket-Key', { status: 400 });
-    }
+  const webSocket = new WebSocket(req.url);
+  const socketId = Math.random().toString(36).substring(2, 15);
+  const conn: WebSocketConnection = {
+    socket: webSocket,
+    roomCode: undefined,
+    playerId: undefined,
+  };
 
-    const pair = new WebSocketPair();
-    const [client, server] = Object.values(pair);
-    const socketId = Math.random().toString(36).substring(7);
+  activeConnections.set(socketId, conn);
 
-    const connection: WebSocketConnection = {
-      socket: server as WebSocket,
-      roomCode: null,
-      playerId: null
-    };
-
-    connections.set(socketId, connection);
-
-    server.addEventListener('message', async (event: MessageEvent) => {
-      try {
-        const message: WebSocketMessage = JSON.parse(event.data.toString());
-        await handleMessage(socketId, connection, JSON.stringify(message));
-      } catch (error) {
-        console.error('Error handling message:', error);
-        server.send(JSON.stringify({
+  webSocket.onmessage = async (event: MessageEvent) => {
+    try {
+      await handleMessage(socketId, conn, event.data.toString());
+    } catch (error) {
+      console.error('Error handling message:', error);
+      webSocket.send(
+        JSON.stringify({
           type: 'error',
-          data: { message: 'Invalid message format' }
-        }));
-      }
-    });
+          message: 'Internal server error',
+        })
+      );
+    }
+  };
 
-    server.addEventListener('close', () => {
-      const conn = connections.get(socketId);
-      if (conn?.roomCode && conn.playerId) {
-        const room = rooms.get(conn.roomCode);
-        if (room) {
-          const playerIndex = room.players.findIndex(p => p.id === conn.playerId);
-          if (playerIndex !== -1) {
-            room.players.splice(playerIndex, 1);
-            if (room.players.length === 0) {
-              rooms.delete(conn.roomCode);
-            } else {
-              if (room.host.id === conn.playerId) {
-                room.host = room.players[0];
-                room.players[0].isHost = true;
-              }
-              broadcastToRoom(conn.roomCode, {
-                type: 'player-left',
-                data: {
-                  playerId: conn.playerId,
-                  players: room.players,
-                  host: room.host
-                }
-              });
-            }
-          }
+  webSocket.onclose = () => {
+    if (conn.roomCode) {
+      const room = rooms.get(conn.roomCode);
+      if (room) {
+        room.players = room.players.filter(
+          (p) => p.id !== conn.playerId
+        );
+
+        if (room.players.length === 0) {
+          rooms.delete(conn.roomCode);
+        } else if (room.host?.id === conn.playerId && room.players.length > 0) {
+          room.host = room.players[0];
+          room.players[0].isHost = true;
+
+          broadcastToRoom(conn.roomCode, {
+            type: 'playerLeft',
+            playerId: conn.playerId,
+            players: room.players,
+            host: room.host,
+          });
         }
       }
-      connections.delete(socketId);
-    });
+    }
 
-    server.addEventListener('error', (error: Event) => {
-      console.error('WebSocket error:', error);
-      connections.delete(socketId);
-    });
+    activeConnections.delete(socketId);
+  };
 
-    server.accept();
-
-    return new Response(null, {
-      status: 101,
-      webSocket: client
-    });
-
-  } catch (error) {
-    console.error('WebSocket upgrade failed:', error);
-    return new Response('WebSocket upgrade failed', { status: 500 });
-  }
+  return new Response(null, {
+    status: 101,
+    headers: {
+      'Upgrade': 'websocket',
+      'Connection': 'Upgrade',
+      'Sec-WebSocket-Accept': acceptKey,
+      'Sec-WebSocket-Protocol': socketProtocol,
+    },
+  });
 }
